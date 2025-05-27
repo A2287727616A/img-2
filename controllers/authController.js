@@ -5,10 +5,11 @@ const logger = require('../config/logger');
 const transporter = require('../config/mailer');
 const { isValidPassword, isValidEmail } = require('../utils/validation');
 const { generateSecureToken } = require('../utils/token'); // Using secure token
+const { logAction, ACTION_TYPES } = require('../services/auditLogService');
 
 const register = async (req, res) => {
   const { email, password } = req.body;
-  const turnstileToken = req.body['cf-turnstile-response'];
+  // const turnstileToken = req.body['cf-turnstile-response']; // Handled by middleware
   const clientIp = req.ip;
 
   // 1. Cloudflare Turnstile Verification
@@ -86,6 +87,7 @@ const register = async (req, res) => {
       role: 'user', // Default role
     });
     logger.info('New user record created, pending verification.', { userId: newUser.id, email });
+    await logAction({ actorUserId: newUser.id, actorIp: clientIp, actionType: ACTION_TYPES.USER_REGISTER_SUCCESS, targetUserId: newUser.id });
 
     // 7. Send Verification Email
     // Construct verification URL
@@ -196,6 +198,7 @@ const verifyEmail = async (req, res) => {
     // 6. Success Response
     // For an API, a JSON response is standard.
     // If this were a full-stack app with server-side rendering, a redirect might be used.
+    await logAction({ actorUserId: user.id, actorIp: req.ip, actionType: ACTION_TYPES.USER_EMAIL_VERIFIED, targetUserId: user.id });
     return res.status(200).json({ message: 'Email successfully verified. You can now log in.' });
 
   } catch (error) {
@@ -232,42 +235,44 @@ const login = async (req, res) => {
 
     if (!user) {
       logger.warn('Login attempt for non-existent email.', { email, ip: clientIp });
+      await logAction({ actorIp: clientIp, actionType: ACTION_TYPES.USER_LOGIN_FAIL, details: { email_attempt: email, reason: 'User not found' } });
       return res.status(401).json({ message: 'Invalid email or password.' });
     }
 
     // 4. Check Account Verification Status
     if (!user.is_verified) {
       logger.info('Login attempt for unverified account.', { userId: user.id, email, ip: clientIp });
+      await logAction({ actorUserId: user.id, actorIp: clientIp, actionType: ACTION_TYPES.USER_LOGIN_FAIL, targetUserId: user.id, details: { reason: 'Account not verified' } });
       return res.status(403).json({ message: 'Account not verified. Please check your email.' });
     }
 
     // 5. Check Ban Status
     if (user.is_banned) {
       logger.info('Login attempt by banned user (manual ban).', { userId: user.id, email, ip: clientIp, reason: user.ban_reason });
+      await logAction({ actorUserId: user.id, actorIp: clientIp, actionType: ACTION_TYPES.USER_LOGIN_FAIL, targetUserId: user.id, details: { reason: 'Account banned (manual)', ban_reason: user.ban_reason } });
       return res.status(403).json({ message: `您的账户已被暂停。原因：${user.ban_reason || '无特定原因'}。如有疑问，请联系管理员。` });
     }
     if (user.auto_banned_at) {
       logger.info('Login attempt by banned user (auto ban).', { userId: user.id, email, ip: clientIp, reason: user.auto_ban_reason });
+      await logAction({ actorUserId: user.id, actorIp: clientIp, actionType: ACTION_TYPES.USER_LOGIN_FAIL, targetUserId: user.id, details: { reason: 'Account banned (auto)', ban_reason: user.auto_ban_reason } });
       return res.status(403).json({ message: `您的账户因违反安全策略已被系统自动暂停。原因：${user.auto_ban_reason || '无特定原因'}。您可以尝试通过邮件申请解封，或联系管理员。` });
     }
 
     // 6. Verify Password
     const isPasswordValid = await user.validPassword(password); // Assumes validPassword method exists on User model
     if (!isPasswordValid) {
-      // Increment failed_login_attempts and set last_failed_login_at (basic implementation)
-      // A more advanced implementation would involve locking the account after too many attempts.
       user.failed_login_attempts = (user.failed_login_attempts || 0) + 1;
       user.last_failed_login_at = new Date();
-      await user.save(); // Save these changes
+      await user.save();
 
       logger.warn('Invalid password attempt.', { userId: user.id, email, ip: clientIp });
+      await logAction({ actorUserId: user.id, actorIp: clientIp, actionType: ACTION_TYPES.USER_LOGIN_FAIL, targetUserId: user.id, details: { reason: 'Invalid password' } });
       return res.status(401).json({ message: 'Invalid email or password.' });
     }
 
     // 7. Successful Login - Reset failed attempts
     if (user.failed_login_attempts > 0) {
       user.failed_login_attempts = 0;
-      // user.last_failed_login_at = null; // Or keep it for record, depends on policy
       await user.save();
     }
 
@@ -352,10 +357,17 @@ const login = async (req, res) => {
     }
 
     // 11. Response (normal login)
-    logger.info('User logged in successfully.', { userId: user.id, email, ip: clientIp });
+    // USER_LOGIN_SUCCESS is logged in issueJwtAndLogLogin if 2FA is not enabled,
+    // or in verify2FA if 2FA is enabled.
+    // If 2FA is not enabled, log it here.
+    if (!user.two_factor_enabled) {
+        // This logAction will be moved into issueJwtAndLogLogin or handled by its caller
+        // await logAction({ actorUserId: user.id, actorIp: clientIp, actionType: ACTION_TYPES.USER_LOGIN_SUCCESS, targetUserId: user.id, details: { sessionId } });
+    }
+    logger.info('User logged in successfully (password validated).', { userId: user.id, email, ip: clientIp });
     res.status(200).json({
       message: 'Login successful.',
-      user: { // Return non-sensitive user info
+      user: { 
         id: user.id,
         email: user.email,
         role: user.role,
@@ -405,7 +417,7 @@ const requestPasswordReset = async (req, res) => {
     user.reset_password_token_expires_at = resetTokenExpiresAt;
     await user.save(); // This will use default scope, ensure it doesn't strip fields if 'withSensitiveInfo' was used to fetch.
                        // In this case, we fetched with default, and are setting fields not in defaultScope's exclude list.
-
+    await logAction({ actorUserId: user.id, actorIp: req.ip, actionType: ACTION_TYPES.USER_PASSWORD_RESET_REQUEST, targetUserId: user.id });
     logger.info('Password reset token generated and saved for user.', { userId: user.id, email });
 
     // Send Reset Email
@@ -500,6 +512,7 @@ const resetPassword = async (req, res) => {
 
     await user.save();
     logger.info('Password successfully reset for user.', { userId: user.id, email: user.email });
+    await logAction({ actorUserId: user.id, actorIp: req.ip, actionType: ACTION_TYPES.USER_PASSWORD_RESET_SUCCESS, targetUserId: user.id });
 
     // 5. Send Confirmation Email
     const mailOptions = {
@@ -652,8 +665,8 @@ const verify2FA = async (req, res) => {
   }
 };
 
-// Helper function to issue JWT and log login (extracted from original login for reuse)
-async function issueJwtAndLogLogin(req, res, user) {
+// Helper function to issue JWT, log UserIp, and log the audit action
+async function issueJwtAndLogLogin(req, res, user, actionType = ACTION_TYPES.USER_LOGIN_SUCCESS, auditDetails = {}) {
   const clientIp = req.ip;
   const userAgent = req.headers['user-agent'];
   const sessionId = crypto.randomBytes(16).toString('hex');
@@ -662,6 +675,7 @@ async function issueJwtAndLogLogin(req, res, user) {
     id: user.id,
     email: user.email,
     role: user.role,
+    is_verified: user.is_verified, // Add is_verified to JWT payload
     jti: sessionId,
   };
   const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '1d' });

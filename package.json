@@ -29,6 +29,7 @@
     "express-rate-limit": "^7.5.0",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.0",
     "mysql2": "^3.14.1",
     "node-cron": "^4.0.7",
     "nodemailer": "^7.0.3",
@@ -36,9 +37,11 @@
     "sequelize": "^6.37.7",
     "sharp": "^0.34.2",
     "speakeasy": "^2.0.0",
+    "uuid": "^11.1.0",
     "winston": "^3.17.0"
   },
   "devDependencies": {
+    "@types/uuid": "^10.0.0",
     "nodemon": "^3.1.10"
   }
 }

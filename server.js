@@ -22,6 +22,10 @@ const authRoutes = require('./routes/authRoutes');
 
 // Mount routers
 app.use('/api/auth', authRoutes);
+const userRoutes = require('./routes/userRoutes'); // Assuming this exists
+app.use('/api/user', userRoutes); // Assuming this exists
+const imageRoutes = require('./routes/imageRoutes');
+app.use('/api/images', imageRoutes);
 
 
 // Basic route
@@ -35,6 +39,7 @@ const { createDefaultSuperAdmin } = require('./services/setupService');
 
 const { createDefaultSuperAdmin } = require('./services/setupService');
 const { initializeCronJobs } = require('./services/cronJobs');
+const { applyS3LifecyclePolicy } = require('./services/s3Service'); // Import S3 lifecycle setup
 
 // Sync database and start server
 async function startServer() {
@@ -53,8 +58,11 @@ async function startServer() {
       // Initialize cron jobs
       initializeCronJobs();
 
+      // Attempt to apply S3 lifecycle policy
+      await applyS3LifecyclePolicy();
+
     } catch (error) {
-      logger.error('Unable to connect to the database, synchronize models, create default admin, or initialize crons:', error);
+      logger.error('Error during server startup (DB sync, admin creation, crons, or S3 lifecycle):', error);
       // process.exit(1); // Optionally exit if critical setup fails
     }
   }

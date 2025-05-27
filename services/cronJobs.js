@@ -3,6 +3,7 @@ const { User } = require('../models');
 const { Op } = require('sequelize'); // To use operators like Op.lte
 const logger = require('../config/logger');
 const transporter = require('../config/mailer');
+const { logAction, ACTION_TYPES } = require('./auditLogService'); // Added for audit logging
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -45,6 +46,13 @@ async function finalizeEmailChanges() {
 
       await user.save();
       logger.info(`Cron job: Email for user ${user.id} successfully changed from ${oldEmail} to ${newEmail}.`);
+      await logAction({
+        actorUserId: null, // System Action
+        actorIp: 'SYSTEM',
+        actionType: ACTION_TYPES.USER_EMAIL_CHANGE_FINALIZED_BY_CRON,
+        targetUserId: user.id,
+        details: { oldEmail: oldEmail, newEmail: user.email }
+      });
 
       // Notify Old Email (Final Confirmation)
       const mailToOldOptions = {
@@ -184,6 +192,15 @@ async function processAccountDeletions() {
         // Note: We are not deleting ImageReport records where user's images are reported, as those reports might still be valid.
         // Also, reports reviewed by this user (if admin) will have reviewed_by_admin_id set to null due to User model's onDelete constraint.
 
+        // Log before destroying user record
+        await logAction({
+          actorUserId: null, // System Action
+          actorIp: 'SYSTEM',
+          actionType: ACTION_TYPES.USER_ACCOUNT_DELETED_BY_CRON,
+          targetUserId: user.id,
+          details: { email: user.email, userId: user.id } // Include user.id in details for cross-referencing
+        });
+
         // Delete User Record
         logger.info(`Cron job: Deleting User record for user ${user.id}.`);
         await user.destroy(); // This is the user instance from usersToDelete
@@ -228,8 +245,93 @@ function initializeCronJobs() {
   logger.info('Cron jobs initialized.');
 }
 
+async function deleteExpiredImages() {
+  logger.info('Cron Job: Running deleteExpiredImages to remove images older than 72 hours.');
+  try {
+    // const cutoffDate = new Date(Date.now() - 72 * 60 * 60 * 1000); // Alternative if using uploaded_at
+    const expiredImages = await Image.findAll({
+      where: {
+        expires_at: { [Op.lt]: new Date() },
+      },
+      attributes: ['id', 's3_object_key', 'user_id'], // Only fetch necessary fields
+    });
+
+    if (expiredImages.length === 0) {
+      logger.info('Cron Job: No expired images found to delete at this time.');
+      return;
+    }
+
+    logger.info(`Cron Job: Found ${expiredImages.length} expired images to delete.`);
+    
+    // Extract S3 keys. s3Service.deleteMultipleObjects expects an array of strings (keys)
+    const s3KeysToDelete = expiredImages.map(img => img.s3_object_key).filter(key => key);
+    const imageIdsToDelete = expiredImages.map(img => img.id);
+
+    // Delete from S3
+    if (s3KeysToDelete.length > 0) {
+      const s3DeletionSuccess = await deleteMultipleObjects(s3KeysToDelete); 
+      if (s3DeletionSuccess) {
+        logger.info(`Cron Job: Successfully submitted deletion request to S3 for ${s3KeysToDelete.length} objects.`);
+      } else {
+        logger.error(`Cron Job: S3 deletion request for ${s3KeysToDelete.length} objects reported errors. See previous logs.`);
+        // Potentially do not delete from DB if S3 deletion failed, or handle partially.
+        // For now, we proceed to delete DB records even if S3 had errors, to prevent re-attempts on non-existent S3 keys.
+        // A more robust solution might track S3 deletion failures and retry or flag them.
+      }
+    }
+
+    // Delete from Database
+    if (imageIdsToDelete.length > 0) {
+      await Image.destroy({ where: { id: imageIdsToDelete } });
+      logger.info(`Cron Job: Successfully deleted ${imageIdsToDelete.length} image records from database.`);
+    }
+
+    // Optional: Audit log for each system-deleted image
+    for (const image of expiredImages) {
+      await logAction({ 
+        actorUserId: null, // System action
+        actorIp: 'SYSTEM',
+        actionType: ACTION_TYPES.IMAGE_DELETED_BY_CRON_EXPIRY, // Ensure this ACTION_TYPE is defined
+        targetResourceId: image.id.toString(), // Convert ID to string if necessary
+        targetUserId: image.user_id, // If you want to associate with the user who uploaded
+        details: { s3_object_key: image.s3_object_key }
+      });
+    }
+
+  } catch (error) {
+    logger.error('Cron Job: Error in deleteExpiredImages:', { message: error.message, stack: error.stack });
+  }
+}
+
+
+/**
+ * Initializes and schedules cron jobs.
+ */
+function initializeCronJobs() {
+  // Schedule finalizeEmailChanges to run, e.g., every hour
+  cron.schedule('0 * * * *', () => { // Runs at the start of every hour
+    logger.info('Cron job: Triggering scheduled finalizeEmailChanges.');
+    finalizeEmailChanges();
+  });
+
+  // Schedule processAccountDeletions to run, e.g., every hour (or less frequently)
+  cron.schedule('5 * * * *', () => { // Runs at 5 minutes past every hour
+    logger.info('Cron job: Triggering scheduled processAccountDeletions.');
+    processAccountDeletions();
+  });
+
+  // Schedule deleteExpiredImages to run hourly
+  cron.schedule('10 * * * *', () => { // Runs at 10 minutes past every hour
+    logger.info('Cron Job: Triggering scheduled deleteExpiredImages.');
+    deleteExpiredImages();
+  });
+
+  logger.info('Cron jobs initialized.');
+}
+
 module.exports = {
   initializeCronJobs,
-  finalizeEmailChanges, // Export for potential manual trigger or testing
-  processAccountDeletions, // Export for potential manual trigger or testing
+  finalizeEmailChanges, 
+  processAccountDeletions, 
+  deleteExpiredImages, // Export for potential manual trigger or testing
 };
