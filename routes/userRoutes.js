@@ -34,16 +34,25 @@ tempRouter.get('/verify-new-email', userController.verifyNewEmail);
 tempRouter.get('/confirm-delete-account', userController.confirmAccountDeletion);
 
 
+const { verifyTurnstile } = require('../middlewares/turnstileMiddleware'); // Import verifyTurnstile
+
 // Merge the temporary router for the public route before the isAuthenticated middleware
 const mainRouter = express.Router();
 mainRouter.use('/', tempRouter); // Add the public routes
 mainRouter.use(isAuthenticated); // Protect subsequent routes
-mainRouter.post('/request-email-change-otp', userController.requestEmailChangeOTP);
-mainRouter.post('/request-email-change', userController.requestEmailChange);
+
+// Apply Turnstile to specific authenticated routes
+mainRouter.post('/request-email-change-otp', userController.requestEmailChangeOTP); // No turnstile for OTP request to existing email
+mainRouter.post('/request-email-change', verifyTurnstile, userController.requestEmailChange);
 
 // Account Deletion
-mainRouter.post('/request-account-deletion', userController.requestAccountDeletion);
-mainRouter.post('/cancel-account-deletion', userController.cancelAccountDeletion);
+mainRouter.post('/request-account-deletion', verifyTurnstile, userController.requestAccountDeletion);
+mainRouter.post('/cancel-account-deletion', userController.cancelAccountDeletion); // No turnstile for cancel, user is authenticated
+
+// Two-Factor Authentication
+mainRouter.post('/2fa/setup-request', verifyTurnstile, userController.setup2FA);
+mainRouter.post('/2fa/verify-and-enable', verifyTurnstile, userController.verifyAndEnable2FA);
+mainRouter.post('/2fa/disable', verifyTurnstile, userController.disable2FA);
 
 
 // Placeholder for other user-specific routes like:

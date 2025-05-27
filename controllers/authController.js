@@ -215,43 +215,11 @@ const { UserIp } = require('../models'); // User model is already imported
 
 const login = async (req, res) => {
   const { email, password } = req.body;
-  const turnstileToken = req.body['cf-turnstile-response'];
+  // const turnstileToken = req.body['cf-turnstile-response']; // Handled by middleware
   const clientIp = req.ip;
   const userAgent = req.headers['user-agent'];
 
-  // 1. Cloudflare Turnstile Verification
-  if (process.env.NODE_ENV !== 'development') { // Skip in dev for convenience, or use a flag
-    if (!turnstileToken) {
-      logger.warn('Turnstile token missing for login attempt.', { email, ip: clientIp });
-      return res.status(400).json({ message: 'CAPTCHA verification failed. Please try again.' });
-    }
-    try {
-      const turnstileResponse = await axios.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-        secret: process.env.CLOUDFLARE_TURNSTILE_SECRET_KEY,
-        response: turnstileToken,
-        remoteip: clientIp,
-      }, { headers: { 'Content-Type': 'application/json' } });
-
-      if (!turnstileResponse.data.success) {
-        logger.warn('Turnstile verification failed for login.', {
-          email,
-          ip: clientIp,
-          'error-codes': turnstileResponse.data['error-codes'],
-        });
-        return res.status(400).json({ message: 'CAPTCHA verification failed. Please try again.' });
-      }
-      logger.info('Turnstile verification successful for login.', { email, ip: clientIp });
-    } catch (error) {
-      logger.error('Error during Turnstile verification for login:', {
-        message: error.message,
-        stack: error.stack,
-        email,
-        ip: clientIp,
-      });
-      return res.status(500).json({ message: 'Error verifying CAPTCHA. Please try again later.' });
-    }
-  }
-
+  // 1. Cloudflare Turnstile Verification - Now handled by middleware
 
   // 2. Input Validation
   if (!email || !password) {
@@ -317,7 +285,7 @@ const login = async (req, res) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || '1d' }
     );
 
-    // 8. Check for Pending Deletion
+    // 8. Check for Pending Deletion (before 2FA check for logical flow)
     if (user.account_deletion_requested_at &&
         user.account_deletion_token_expires_at && // This field now stores the final deletion time
         new Date(user.account_deletion_token_expires_at) > new Date()) {
@@ -328,23 +296,27 @@ const login = async (req, res) => {
         deletionScheduledAt: user.account_deletion_token_expires_at.toISOString() 
       });
       
-      // Return a specific status/message to frontend to prompt for cancellation
-      // A 202 (Accepted) or a custom success code could be used.
-      // Or, return a normal 200 with a specific flag in the body.
-      return res.status(202).json({ // Using 202 Accepted
+      return res.status(202).json({ 
         message: 'Account scheduled for deletion.',
         deletion_scheduled_at: user.account_deletion_token_expires_at.toISOString(),
-        user: {
-          id: user.id,
-          email: user.email,
-          role: user.role,
-        },
-        // No token is returned yet. Frontend needs to call cancel-account-deletion
-        // and then potentially re-login or be issued a token upon successful cancellation.
+        user: { id: user.id, email: user.email, role: user.role },
       });
     }
 
-    // 9. Session/JWT Generation (moved after deletion check)
+    // 9. Check if 2FA is Enabled
+    // User model should already have two_factor_enabled, two_factor_secret loaded via 'withSensitiveInfo' scope
+    if (user.two_factor_enabled && user.two_factor_secret) { // Check secret exists to ensure setup was completed
+      logger.info(`2FA enabled for user ${user.id}. Prompting for 2FA token.`);
+      // Do NOT issue JWT yet. Send a response indicating 2FA is required.
+      return res.status(202).json({ // Using 202 (Accepted) or a custom status/flag
+        status: '2FA_REQUIRED', // Custom status for frontend to handle
+        message: 'Two-Factor Authentication required. Please provide your authentication code.',
+        userId: user.id, // Send userId to be used in the /verify-2fa call
+      });
+    }
+    
+    // If 2FA is not enabled, proceed to JWT generation (original step 9, now step 10)
+    // 10. Session/JWT Generation
     const sessionId = crypto.randomBytes(16).toString('hex'); // Unique ID for this session/token
     const tokenPayload = {
       id: user.id,
@@ -572,10 +544,156 @@ const resetPassword = async (req, res) => {
 };
 
 
+const { decrypt } = require('../utils/encryption'); // Assuming encryption.js is in utils
+const speakeasy = require('speakeasy'); // For TOTP verification
+
+const verify2FA = async (req, res) => {
+  const { userId, token: twoFactorToken } = req.body; // 'token' from request is the 2FA code
+
+  if (!userId || !twoFactorToken) {
+    return res.status(400).json({ message: 'User ID and 2FA token are required.' });
+  }
+
+  try {
+    const user = await User.scope('withSensitiveInfo').findByPk(userId);
+    if (!user || !user.two_factor_enabled || !user.two_factor_secret) {
+      logger.warn('2FA verification attempt for user without 2FA enabled or secret missing.', { userId });
+      return res.status(401).json({ message: '2FA is not enabled for this account or setup is incomplete.' });
+    }
+
+    // Decrypt the stored 2FA secret
+    const decryptedSecret = decrypt(user.two_factor_secret);
+    if (!decryptedSecret) {
+      logger.error('Failed to decrypt 2FA secret for user.', { userId });
+      return res.status(500).json({ message: 'Error verifying 2FA. Please contact support.' });
+    }
+
+    // 1. Try verifying as a TOTP token
+    const isValidTOTP = speakeasy.totp.verify({
+      secret: decryptedSecret,
+      encoding: 'base32', // Assuming the secret was stored/handled as base32
+      token: twoFactorToken,
+      window: 1,
+    });
+
+    if (isValidTOTP) {
+      logger.info(`TOTP verification successful for user ${userId}.`);
+      // Proceed to issue JWT and log login
+      return issueJwtAndLogLogin(req, res, user);
+    }
+
+    // 2. If TOTP fails, try verifying as a recovery code
+    const storedHashedRecoveryCodes = user.two_factor_recovery_codes; // This is a JSON string of hashed codes
+    if (storedHashedRecoveryCodes && Array.isArray(storedHashedRecoveryCodes)) { // Ensure it's an array (after JSON.parse in getter)
+      let recoveryCodeMatch = false;
+      let matchedCodeIndex = -1;
+
+      for (let i = 0; i < storedHashedRecoveryCodes.length; i++) {
+        const hashedCode = storedHashedRecoveryCodes[i];
+        // Compare the provided token (plain) against the stored hash
+        if (await bcrypt.compare(twoFactorToken, hashedCode)) {
+          recoveryCodeMatch = true;
+          matchedCodeIndex = i;
+          break;
+        }
+      }
+
+      if (recoveryCodeMatch) {
+        logger.info(`Recovery code verification successful for user ${userId}.`);
+        // Mark recovery code as used by removing it from the array
+        const updatedRecoveryCodes = [...storedHashedRecoveryCodes];
+        updatedRecoveryCodes.splice(matchedCodeIndex, 1);
+        user.two_factor_recovery_codes = JSON.stringify(updatedRecoveryCodes); // Store back as JSON string
+        
+        // Check if all recovery codes are used up, and if so, send a warning email
+        if (updatedRecoveryCodes.length === 0) {
+            logger.warn(`User ${userId} has used their last 2FA recovery code.`);
+            // Send email notification
+            const mailOptions = {
+                to: user.email,
+                from: `"${process.env.MAIL_FROM_NAME}" <${process.env.MAIL_FROM_ADDRESS}>`,
+                subject: 'All 2FA Recovery Codes Used - Memory Echoes Account Security',
+                html: `
+                    <p>Hello ${user.email},</p>
+                    <p>You have just used your last Two-Factor Authentication (2FA) recovery code for your Memory Echoes account.</p>
+                    <p>For continued account security, we strongly recommend that you log in and either:</p>
+                    <ul>
+                        <li>Disable and then re-enable 2FA to generate a new set of recovery codes.</li>
+                        <li>Ensure your primary authenticator app is accessible.</li>
+                    </ul>
+                    <p>If you lose access to your authenticator app and have no recovery codes, you may lose access to your account.</p>
+                    <p>If you did not authorize this action, please contact support immediately.</p>
+                `,
+            };
+            try {
+                await transporter.sendMail(mailOptions);
+                logger.info(`"Last recovery code used" notification sent to ${user.email} for user ${userId}.`);
+            } catch (mailError) {
+                logger.error('Failed to send "last recovery code used" notification email:', { userId, email: user.email, mailError});
+            }
+        }
+        await user.save();
+        return issueJwtAndLogLogin(req, res, user); // Proceed to issue JWT
+      }
+    }
+
+    // If both TOTP and recovery code fail
+    logger.warn('Invalid 2FA token or recovery code provided.', { userId });
+    // Increment failed login attempts for 2FA? Could be a feature. For now, just deny.
+    return res.status(401).json({ message: 'Invalid 2FA token or recovery code.' });
+
+  } catch (error) {
+    logger.error('Error during 2FA verification:', {
+      userId,
+      message: error.message,
+      stack: error.stack,
+    });
+    return res.status(500).json({ message: 'An error occurred during 2FA verification.' });
+  }
+};
+
+// Helper function to issue JWT and log login (extracted from original login for reuse)
+async function issueJwtAndLogLogin(req, res, user) {
+  const clientIp = req.ip;
+  const userAgent = req.headers['user-agent'];
+  const sessionId = crypto.randomBytes(16).toString('hex');
+
+  const tokenPayload = {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+    jti: sessionId,
+  };
+  const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '1d' });
+
+  try {
+    await UserIp.create({
+      user_id: user.id,
+      ip_address: clientIp,
+      user_agent: userAgent,
+      session_id: sessionId,
+      is_active_session: true,
+      last_login_at: new Date(), // Or use existing if this is just 2FA step after initial login
+      last_activity_at: new Date(),
+    });
+    logger.info('User IP and agent logged after 2FA.', { userId: user.id, ip: clientIp, sessionId });
+  } catch (logError) {
+    logger.error('Failed to log user IP and agent after 2FA:', { userId: user.id, message: logError.message });
+  }
+
+  res.status(200).json({
+    message: 'Login successful (2FA verified).',
+    user: { id: user.id, email: user.email, role: user.role },
+    token,
+  });
+}
+
+
 module.exports = {
   register,
   verifyEmail,
   login,
   requestPasswordReset,
   resetPassword,
+  verify2FA,
 };

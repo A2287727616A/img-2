@@ -294,7 +294,7 @@ const axios = require('axios'); // For Turnstile, if not already imported
 const requestAccountDeletion = async (req, res) => {
   const userId = req.user.id;
   const { current_password } = req.body;
-  const turnstileToken = req.body['cf-turnstile-response'];
+  // const turnstileToken = req.body['cf-turnstile-response']; // Handled by middleware
   const clientIp = req.ip;
 
   // 1. Input Validation
@@ -302,38 +302,7 @@ const requestAccountDeletion = async (req, res) => {
     return res.status(400).json({ message: 'Current password is required.' });
   }
 
-  // 2. Cloudflare Turnstile Verification
-  if (process.env.NODE_ENV !== 'development') { // Skip in dev for convenience
-    if (!turnstileToken) {
-      logger.warn('Turnstile token missing for account deletion request.', { userId, ip: clientIp });
-      return res.status(403).json({ message: 'CAPTCHA verification failed. Please try again.' });
-    }
-    try {
-      const turnstileResponse = await axios.post('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-        secret: process.env.CLOUDFLARE_TURNSTILE_SECRET_KEY,
-        response: turnstileToken,
-        remoteip: clientIp,
-      }, { headers: { 'Content-Type': 'application/json' } });
-
-      if (!turnstileResponse.data.success) {
-        logger.warn('Turnstile verification failed for account deletion.', {
-          userId,
-          ip: clientIp,
-          'error-codes': turnstileResponse.data['error-codes'],
-        });
-        return res.status(403).json({ message: 'CAPTCHA verification failed. Please try again.' });
-      }
-      logger.info('Turnstile verification successful for account deletion.', { userId, ip: clientIp });
-    } catch (error) {
-      logger.error('Error during Turnstile verification for account deletion:', {
-        userId,
-        message: error.message,
-        stack: error.stack,
-        ip: clientIp,
-      });
-      return res.status(500).json({ message: 'Error verifying CAPTCHA. Please try again later.' });
-    }
-  }
+  // 2. Cloudflare Turnstile Verification - Now handled by middleware
 
   try {
     const user = await User.scope('withSensitiveInfo').findByPk(userId);
@@ -527,6 +496,251 @@ const cancelAccountDeletion = async (req, res) => {
   }
 };
 
+const speakeasy = require('speakeasy');
+const qrcode = require('qrcode');
+
+const setup2FA = async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    const user = await User.scope('withSensitiveInfo').findByPk(userId); // Ensure sensitive fields can be checked/set
+    if (!user) {
+      logger.warn('User not found for 2FA setup after authentication.', { userId });
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (user.two_factor_enabled) {
+      return res.status(400).json({ message: '2FA is already enabled on your account.' });
+    }
+
+    // Generate a new secret
+    // The name includes the user's email to help them identify the account in their authenticator app.
+    // The issuer name 'Memory Echoes' makes it official.
+    const secret = speakeasy.generateSecret({
+      name: `Memory Echoes (${user.email})`,
+      issuer: 'Memory Echoes',
+    });
+
+    // secret.base32 is the secret key for the user to manually enter.
+    // secret.otpauth_url is the URL for the QR code.
+
+    // Generate QR code data URL
+    qrcode.toDataURL(secret.otpauth_url, (err, data_url) => {
+      if (err) {
+        logger.error('Failed to generate QR code for 2FA setup:', { userId, message: err.message });
+        return res.status(500).json({ message: 'Failed to generate QR code. Please try again.' });
+      }
+
+      // IMPORTANT: The 'secret.base32' needs to be temporarily stored or sent to the client
+      // and then sent back in the verifyAndEnable2FA step.
+      // For an API, sending it to the client is common. Client must handle it securely.
+      // Storing it in user session on server-side is another option if using sessions.
+      // For this stateless API approach, we'll send it and expect it back.
+      // Consider adding a short expiry to this setup process if storing temporarily server-side.
+
+      logger.info(`2FA setup initiated for user ${userId}. Secret (for QR) generated.`);
+      res.status(200).json({
+        message: '2FA setup initiated. Scan QR code or enter secret in your authenticator app.',
+        secret: secret.base32, // This is the key the user would manually type in.
+        qr_code_data_url: data_url, // Data URL for the QR code image.
+        otpauth_url: secret.otpauth_url, // Raw OTP Auth URL, useful for some apps or debugging
+      });
+    });
+
+  } catch (error) {
+    logger.error('Error during 2FA setup request:', {
+      userId,
+      message: error.message,
+      stack: error.stack,
+    });
+    return res.status(500).json({ message: 'An error occurred during 2FA setup. Please try again.' });
+  }
+};
+
+const { encrypt } = require('../utils/encryption'); // Assuming encryption.js is in utils
+
+const verifyAndEnable2FA = async (req, res) => {
+  const userId = req.user.id;
+  const { token, temp_secret } = req.body; // temp_secret is the base32 secret from setup2FA
+
+  if (!token || !temp_secret) {
+    return res.status(400).json({ message: 'TOTP token and temporary secret are required.' });
+  }
+
+  try {
+    const user = await User.scope('withSensitiveInfo').findByPk(userId);
+    if (!user) {
+      logger.warn('User not found for 2FA verification after authentication.', { userId });
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (user.two_factor_enabled) {
+      return res.status(400).json({ message: '2FA is already enabled.' });
+    }
+
+    // Verify TOTP token
+    const isValidToken = speakeasy.totp.verify({
+      secret: temp_secret, // Use the raw base32 secret provided by client from setup step
+      encoding: 'base32',
+      token: token,
+      window: 1, // Allow for a 30-second window drift (1 step before or 1 step after current)
+    });
+
+    if (!isValidToken) {
+      logger.warn('Invalid TOTP token during 2FA setup verification.', { userId });
+      return res.status(400).json({ message: 'Invalid TOTP token. Please check your authenticator app and try again.' });
+    }
+
+    // Encrypt the 2FA secret before storing
+    const encryptedSecret = encrypt(temp_secret);
+    if (!encryptedSecret) {
+      logger.error('Failed to encrypt 2FA secret for storage.', { userId });
+      return res.status(500).json({ message: 'Failed to secure 2FA setup. Please try again.' });
+    }
+    user.two_factor_secret = encryptedSecret;
+
+    // Generate and hash recovery codes
+    const recoveryCodes = [];
+    const hashedRecoveryCodes = [];
+    for (let i = 0; i < 10; i++) { // Generate 10 recovery codes
+      const code = generateAlphanumericToken(12); // 12-character alphanumeric
+      recoveryCodes.push(code);
+      // Hash the recovery code before storing. Using bcrypt for consistency with password hashing.
+      // If using SHA256, ensure it's salted or use a strong HMAC. bcrypt is generally good.
+      const salt = await bcrypt.genSalt(10);
+      hashedRecoveryCodes.push(await bcrypt.hash(code, salt));
+    }
+    user.two_factor_recovery_codes = JSON.stringify(hashedRecoveryCodes); // Store as JSON string of hashes
+
+    user.two_factor_enabled = true;
+    await user.save();
+    logger.info(`2FA enabled successfully for user ${userId}.`);
+
+    // Send Notification Email
+    const mailOptions = {
+      to: user.email,
+      from: `"${process.env.MAIL_FROM_NAME}" <${process.env.MAIL_FROM_ADDRESS}>`,
+      subject: 'Two-Factor Authentication (2FA) Enabled on Your Memory Echoes Account',
+      html: `
+        <p>Hello ${user.email},</p>
+        <p>Two-Factor Authentication (2FA) has been successfully enabled on your Memory Echoes account.</p>
+        <p>You will now be required to provide a code from your authenticator app when logging in.</p>
+        <p><strong>Keep your recovery codes safe!</strong> These codes can be used to access your account if you lose access to your authenticator app. Store them in a secure location.</p>
+        <p>If you did not authorize this change, please contact support immediately.</p>
+      `,
+    };
+    try {
+      await transporter.sendMail(mailOptions);
+      logger.info(`2FA enabled notification sent to ${user.email} for user ${userId}.`);
+    } catch (mailError) {
+        logger.error('Failed to send 2FA enabled notification email:', { userId, email: user.email, mailError});
+    }
+
+
+    // Respond with the plain recovery codes (display ONCE to the user)
+    res.status(200).json({
+      message: '2FA enabled successfully. Please save your recovery codes securely.',
+      recovery_codes: recoveryCodes, // Send plain codes for user to save
+    });
+
+  } catch (error) {
+    logger.error('Error verifying and enabling 2FA:', {
+      userId,
+      message: error.message,
+      stack: error.stack,
+    });
+    return res.status(500).json({ message: 'An error occurred. Please try again.' });
+  }
+};
+
+
+const { decrypt } = require('../utils/encryption'); // Already imported for verifyAndEnable2FA if in same file
+
+const disable2FA = async (req, res) => {
+  const userId = req.user.id;
+  const { current_password, token: totpToken } = req.body;
+
+  if (!current_password || !totpToken) {
+    return res.status(400).json({ message: 'Current password and TOTP token are required.' });
+  }
+
+  try {
+    const user = await User.scope('withSensitiveInfo').findByPk(userId);
+    if (!user) {
+      logger.warn('User not found for 2FA disable after authentication.', { userId });
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    if (!user.two_factor_enabled || !user.two_factor_secret) {
+      return res.status(400).json({ message: '2FA is not currently enabled on your account.' });
+    }
+
+    // 1. Verify Current Password
+    const isPasswordValid = await user.validPassword(current_password);
+    if (!isPasswordValid) {
+      logger.warn('Invalid current password during 2FA disable attempt.', { userId });
+      return res.status(401).json({ message: 'Invalid current password.' });
+    }
+
+    // 2. Decrypt 2FA Secret and Verify TOTP Token
+    const decryptedSecret = decrypt(user.two_factor_secret);
+    if (!decryptedSecret) {
+      logger.error('Failed to decrypt 2FA secret for user during disable.', { userId });
+      return res.status(500).json({ message: 'Error disabling 2FA. Please contact support.' });
+    }
+
+    const isValidToken = speakeasy.totp.verify({
+      secret: decryptedSecret,
+      encoding: 'base32',
+      token: totpToken,
+      window: 1,
+    });
+
+    if (!isValidToken) {
+      logger.warn('Invalid TOTP token during 2FA disable attempt.', { userId });
+      return res.status(400).json({ message: 'Invalid TOTP token.' });
+    }
+
+    // 3. Disable 2FA
+    user.two_factor_secret = null;
+    user.two_factor_enabled = false;
+    user.two_factor_recovery_codes = null;
+    await user.save();
+    logger.info(`2FA disabled successfully for user ${userId}.`);
+
+    // 4. Send Notification Email
+    const mailOptions = {
+      to: user.email,
+      from: `"${process.env.MAIL_FROM_NAME}" <${process.env.MAIL_FROM_ADDRESS}>`,
+      subject: 'Two-Factor Authentication (2FA) Disabled on Your Memory Echoes Account',
+      html: `
+        <p>Hello ${user.email},</p>
+        <p>Two-Factor Authentication (2FA) has been successfully disabled on your Memory Echoes account.</p>
+        <p>Your account is no longer protected by 2FA. To re-enable it, please go to your account security settings.</p>
+        <p>If you did not authorize this change, please secure your account (e.g., change your password) and contact support immediately.</p>
+      `,
+    };
+     try {
+      await transporter.sendMail(mailOptions);
+      logger.info(`2FA disabled notification sent to ${user.email} for user ${userId}.`);
+    } catch (mailError) {
+        logger.error('Failed to send 2FA disabled notification email:', { userId, email: user.email, mailError});
+    }
+
+    // 5. Response
+    res.status(200).json({ message: '2FA disabled successfully.' });
+
+  } catch (error) {
+    logger.error('Error disabling 2FA:', {
+      userId,
+      message: error.message,
+      stack: error.stack,
+    });
+    return res.status(500).json({ message: 'An error occurred. Please try again.' });
+  }
+};
+
+
 module.exports = {
   requestEmailChangeOTP,
   requestEmailChange,
@@ -534,4 +748,7 @@ module.exports = {
   requestAccountDeletion,
   confirmAccountDeletion,
   cancelAccountDeletion,
+  setup2FA,
+  verifyAndEnable2FA,
+  disable2FA,
 };
